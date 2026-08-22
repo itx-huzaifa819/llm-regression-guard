@@ -1,0 +1,81 @@
+name: LLM Eval Pipeline
+
+# Trigger on every PR that touches a prompt file. This is the whole point:
+# a prompt change is treated like a code change and gets tested before merge.
+on:
+  pull_request:
+    paths:
+      - "prompts/**"
+  workflow_dispatch:
+    inputs:
+      prompt_path:
+        description: "Prompt YAML to evaluate"
+        required: true
+        default: "prompts/email_classifier_v2.yaml"
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need history so 'runs/' from previous commits is available as baseline
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Determine changed prompt file
+        id: changed
+        run: |
+          if [ -n "${{ github.event.inputs.prompt_path }}" ]; then
+            echo "prompt=${{ github.event.inputs.prompt_path }}" >> "$GITHUB_OUTPUT"
+          else
+            CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- 'prompts/*.yaml' | head -n1)
+            echo "prompt=${CHANGED:-prompts/email_classifier_v1.yaml}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run eval pipeline
+        id: eval
+        env:
+          LLM_PROVIDER: mock  # swap to "openai" and set OPENAI_API_KEY as a repo secret for real runs
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python -m src.cli eval \
+            --prompt "${{ steps.changed.outputs.prompt }}" \
+            --alert \
+            --fail-on-critical
+
+      - name: Upload diff report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-diff-report
+          path: report.html
+
+      - name: Comment on PR with pass/fail summary
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const outcome = '${{ steps.eval.outcome }}';
+            const emoji = outcome === 'success' ? '✅' : '🚨';
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `${emoji} Eval pipeline ${outcome} for \`${{ steps.changed.outputs.prompt }}\`. Full diff report uploaded as a workflow artifact.`
+            });
+
+      - name: Commit run history
+        if: always()
+        run: |
+          git config user.name "eval-bot"
+          git config user.email "eval-bot@users.noreply.github.com"
+          git add runs/
+          git diff --cached --quiet || git commit -m "chore: record eval run [skip ci]"
+          git push || true
